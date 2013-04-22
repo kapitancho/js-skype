@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+	<!-- @author Marian Kostadinov, April 2013 -->
+	<head>
+		<script src="socket.io.js"></script>
+		<script>
+			var SERVER_URL = 'http://localhost:1337';
+			var FILE_CHUNK_SIZE = 1024;
+			var currentClient;
+			var contactList = JSON.parse (localStorage.getItem ('contacts') || '[]');
+			
+			function Client (serverUrl, name, contactList) {
+				this.socket = io.connect(serverUrl);
+				this.socket.emit ('identify', name);
+				
+				this.name = name;
+				this.contactList = contactList;
+				this.openTransfers = {}
+				this.attachHandlers();
+			};
+			Client.prototype.checkOnline = function (callback) {
+				this.socket.emit ('check_online', this.contactList, callback);
+			};
+			Client.prototype.attachHandlers = function() {
+				this.socket.on('incoming_file', function (info) {					
+					ClientUI.showIncomingFile (info);
+				});				
+				this.socket.on('transfer_chunk', (function (chunk, callback) {
+					var transfer = this.openTransfers[chunk];
+					if (transfer.position >= transfer.contents.length) {
+						callback (null);
+					} else {
+						var response = transfer.contents.substr (transfer.position, FILE_CHUNK_SIZE);
+						transfer.position += response.length;
+						callback (response);
+					}
+				}).bind(this));
+				this.socket.on('online_status', function (info) {
+					ClientUI.updateOnlineStatus (info);
+				});
+				
+  				this.socket.on('text_message', function (data) {
+					ClientUI.addReceivedMessage (data);
+  				});
+			};
+			Client.prototype.findUser = function (userName, callback) {
+				this.socket.emit ('find_user', userName, function (result) {
+					if (result) {
+						if (this.contactList.indexOf (userName) == -1) {
+							this.contactList.push (userName);
+							localStorage.setItem ('contacts', JSON.stringify (this.contactList));
+							callback (userName);
+						}						
+					}
+				});
+			};
+			Client.prototype.sendMessage = function (message, recipient) {
+				this.socket.emit ('text_message', { message : message, recipient : recipient });
+			};
+			Client.prototype.sendFile = function (fileName, size, contents, recipient) {
+				var id = this.name + Math.random();
+				contents = contents.substr (7 + contents.indexOf ('base64'));
+				this.openTransfers[id] = { id : id, contents : contents, fileName : fileName, size : size, recipient : recipient, position : 0 };
+				this.socket.emit ('file_transfer_request', { id : id, fileName : fileName, size : size, recipient : recipient, position : 0 });
+			};
+			
+			
+			var ClientUI = {
+				// Section 1 : UI event handlers
+				connectClick : function() {
+					document.getElementById ('connect').disabled = true;
+					document.getElementById ('disconnect').disabled = false;
+				
+					var name = document.getElementById ('name').value;					
+					currentClient = new Client (SERVER_URL, name, contactList);
+					localStorage.setItem ('name', name);
+					document.body.classList.add ('connected');
+					
+					currentClient.checkOnline (ClientUI.updateOnlineUsers.bind(this));
+				},
+				disconnectClick : function() {
+					currentClient.socket.disconnect();
+					currentClient.socket = null;
+					currentClient = null;
+					document.body.classList.remove ('connected');
+					document.getElementById ('disconnect').disabled = true;
+					document.getElementById ('connect').disabled = false;
+				},
+				findUserClick : function() {
+					var userName = document.getElementById ('find_name').value;
+					currentClient.findUser (userName, ClientUI.userFoundStatus.bind (this));
+				},			
+				openContactClick : function (event) {
+					var contactName = event.target.dataset.contact;
+					if (contactName) {
+						ClientUI.requestChatWindow (contactName);
+					}
+				},				
+				enterCheck : function (event) {
+					if (event.keyCode == 13 && event.target.dataset.contact) {
+						var message = event.target.value;
+						var recipient = event.target.dataset.contact;
+						ClientUI.doSendMessage (message, recipient);
+						event.target.value = '';
+					}
+				},
+				// Section 2 : regular activities
+				
+				doSendMessage : function (message, recipient) {
+					currentClient.sendMessage (message, recipient);
+					ClientUI.displayMessage (currentClient.name, message, recipient);
+				},
+				doSendFile : function (fileName, size, contents, recipient) {
+					currentClient.sendFile (fileName, size, contents, recipient);
+					ClientUI.displayMessage (name, "Sending file " + fileName + ', size = ' + size, recipient);
+				},
+										
+				userFoundStatus : function (result) {
+					if (result) {
+						this.loadContact (result, document.getElementById ('contact_list'));
+						this.requestChatWindow (result);
+					}
+				},				
+				updateOnlineUsers : function (onlineUsers) {
+					var contacts_dom = document.querySelectorAll ('#contact_list li');
+					console.log (onlineUsers, contacts_dom.length);
+					for (var i = 0; i < contacts_dom.length; i++) {
+						var contact_dom = contacts_dom[i];
+						console.log (contact_dom.dataset.contact, onlineUsers[contact_dom.dataset.contact]);
+						contact_dom.classList[onlineUsers[contact_dom.dataset.contact] ? 'add' : 'remove'] ('online');
+					}
+				},
+				updateOnlineStatus : function (info) {				
+					var contact_dom = document.querySelector ('#contact_list li[data-contact=' + info.user + ']');
+					if (contact_dom) {
+						contact_dom.classList[info.online ? 'add' : 'remove'] ('online');
+						if (info.online) {
+							this.showNotification (info.user + " is now online");
+						}
+					}										
+				},
+				
+				//Helper functions				
+				
+				addReceivedMessage : function (data) {
+					this.requestChatWindow (data.from);
+					var d = new Date();
+					console.log ('message from:', data.from, ' --- ', d.getHours() + ':' + d.getMinutes() + ' > ' + data.message + "\n");
+					ClientUI.displayMessage (data.from, data.message, data.from);
+					ClientUI.showNotification (data.from + " sent you a message");
+				},				
+				
+				showIncomingFile : function (info) {
+					var a = document.createElement ('a');
+					a.setAttribute ('download', info.fileName);
+					a.href = 'http://localhost:9615/' + info.id;
+					a.innerHTML = 'incoming file: ' + info.fileName + ', size = ' + info.size;
+					ClientUI.displayMessage (info.source, a, info.source);
+					ClientUI.showNotification ("Incoming file transfer");
+				},
+				
+				showNotification : function (message) {
+					var notification = new Notification(message, {
+				          dir: "auto",
+				          lang: "",
+				          //body: data.message,
+				          tag: "sometag",
+				    });						
+				},
+
+				loadContact : function (contactName, parentContainer) {
+					var li = document.createElement ('li');
+					li.innerHTML = contactName;
+					li.dataset.contact = contactName;
+					parentContainer.appendChild (li);
+				},
+
+				requestChatWindow : function (contactName) {
+					var chatContainer = document.getElementById ('chat_windows');
+
+					var oldChatWindow = chatContainer.querySelector ('.active');
+					if (oldChatWindow) {
+						oldChatWindow.classList.remove ('active');
+					}
+					
+					var chatWindowId = 'chat_' + contactName;
+					var chatWindow = document.getElementById ('chat_' + contactName);
+					if (!chatWindow) {
+						chatWindow = this.createChatWindow (chatWindowId, contactName)
+						chatContainer.appendChild (chatWindow);
+					}
+					chatWindow.classList.add ('active');
+				},
+				
+				createChatWindow : function (chatWindowId, contactName) {
+					var chatWindow = document.createElement ('li');
+					chatWindow.id = chatWindowId;
+					chatWindow.innerHTML = document.getElementById ('chat_window_template').innerHTML;						
+					chatWindow.querySelector ('h4').innerHTML = contactName + '--';
+					var chatMessages = chatWindow.querySelector ('.chat_window_messages');
+					chatMessages.dataset.contact = contactName;
+					chatMessages.addEventListener ('drop', function (event) { 
+					    event.stopPropagation();
+        				event.preventDefault();
+        				var files = event.dataTransfer.files;
+						if (files && files.length > 0) {
+							[].forEach.call (files, function (file) {
+								var fr = new FileReader();
+	            				fr.file = file;
+	            				fr.onloadend = function (event) {
+									console.log ('sending file ', file.name, ', size = ', file.size, ' base64 = ', event.target.result);
+									ClientUI.doSendFile (file.name, file.size, event.target.result, contactName);
+								};
+	            				fr.readAsDataURL(file);
+							});
+						}
+					}, true);
+					chatMessages.addEventListener ('dragenter', function (event) { 
+        				event.stopPropagation();
+        				event.preventDefault();
+    				}, true);
+					chatMessages.addEventListener ('dragover', function (event) { 
+        				event.stopPropagation();
+        				event.preventDefault();
+						event.dataTransfer.dropEffect = 'copy';
+    				}, true);
+					
+					chatWindow.querySelector ('input').dataset.contact = contactName;					
+					return chatWindow;
+				},
+				
+				displayMessage : function (author, message, recipient) {
+					var d = new Date();				
+					var m = document.querySelector ('.chat_window_messages[data-contact= ' + recipient + ']');
+					if (m) {
+						if (typeof message == 'string') {
+							m.innerHTML += d.getHours() + ':' + d.getMinutes() + '-' + author + '> ' + message;
+						} else {
+							m.appendChild (message);
+						}
+						m.innerHTML += '<br/>';
+						m.scrollTop = 2000;
+					}
+				},
+				
+				init : function() {
+					var lastUsedName = localStorage.getItem ('name');
+					document.getElementById ('name').value = lastUsedName;
+					
+					var ul = document.getElementById ('contact_list');
+					contactList.forEach (function (contact) { 
+						ClientUI.loadContact (contact, ul); 
+					});
+					ul.addEventListener ('click', ClientUI.openContactClick, true);
+					
+					var chats = document.getElementById ('chat_windows');
+					chats.addEventListener ('keypress', ClientUI.enterCheck, true);
+					
+					if (lastUsedName && lastUsedName.length > 0) {
+						ClientUI.connectClick();
+					}
+					
+					Notification.requestPermission(function(perm) {
+	        			console.log(perm);
+	      			})
+				
+				}
+				
+			};
+		</script>
+		<style>
+			.contacts-area h4 {
+				text-align: center;
+			}
+			#contact_list {
+				margin: 0;
+				padding: 5px;
+			}
+			#contact_list li {
+				cursor: pointer;
+				list-style-type: none;
+				text-indent: 30px;
+				display: block;
+				background-size: 20px 20px;
+				background-repeat: no-repeat;
+background-image: -webkit-gradient(radial, 50% 50%, 0, 50% 50%, 58, color-stop(0%, #e7323a), color-stop(100%, rgba(231,50,58,0)));
+background-image: -webkit-radial-gradient(center center, closest-side circle, #e7323a 0%, rgba(231,50,58,0) 100%);
+background-image: -moz-radial-gradient(center center, closest-side circle, #e7323a 0%, rgba(231,50,58,0) 100%);
+background-image: -ms-radial-gradient(center center, closest-side circle, #e7323a 0%, rgba(231,50,58,0) 100%);
+background-image: -o-radial-gradient(center center, closest-side circle, #e7323a 0%, rgba(231,50,58,0) 100%);
+background-image: radial-gradient(closest-side circle at center center, #e7323a 0%, rgba(231,50,58,0) 100%);
+			}
+			#contact_list li.online {
+				cursor: pointer;
+background-image: -webkit-gradient(radial, 50% 50%, 0, 50% 50%, 58, color-stop(0%, #07640d), color-stop(100%, rgba(7, 100, 13,0)));
+background-image: -webkit-radial-gradient(center center, closest-side circle, #07640d 0%, rgba(7, 100, 13, 0) 100%);
+background-image: -moz-radial-gradient(center center, closest-side circle, #07640d 0%, rgba(7, 100, 13,0) 100%);
+background-image: -ms-radial-gradient(center center, closest-side circle, #07640d 0%, rgba(7, 100, 13,0) 100%);
+background-image: -o-radial-gradient(center center, closest-side circle, #07640d 0%, rgba(7, 100, 13,0) 100%);
+background-image: radial-gradient(closest-side circle at center center, #07640d 0%, rgba(7, 100, 13,0) 100%);
+
+				
+				 
+				
+			}
+			#contact_list li:hover {
+				color: blue;
+			}
+			#chat_window_template {
+				display: none;
+			}
+			#chat_windows {
+				padding: 10px;
+			}
+			
+			#chat_windows li {
+				width: 440px;
+				height: 25px;
+				border: solid 1px black;
+				overflow: hidden;
+				transition: height 0.5s ease-in;
+				display: inline-block;
+				opacity: .4;
+			}
+			
+			#chat_windows li:hover, #chat_windows li.active {
+				opacity: 1;
+			}
+			
+			#chat_windows li.active {
+				height: 210px;
+			}					
+			
+			h4 {
+				margin: 0;
+				padding: 2px;
+			}
+			
+			.chat_window_messages {
+				background: #EEE;
+				width: 100%;
+				height: 150px;
+				overflow: auto;
+				resize: none;
+			}
+			/* LAYOUT */
+			body {		
+				height: 100%;
+				vertical-align: middle;
+			}
+			.main {
+				margin: 0 auto;
+				width: 550px;
+				vertical-align: middle;
+				transition: width 0.5s ease-in;
+				border: dotted 1px black;
+			}
+			.chat-area {
+				display: table-cell;
+				width: 430px;
+				background: #EFE;
+			}
+			.contacts-area {
+				display: table-cell;
+				width: 120px;
+				background: #EEF;
+			}
+			.communication-area {
+				transition: all 0.5s ease-in;
+				max-height: 0;
+				height: auto;
+				overflow: hidden;
+			}
+			.connected .communication-area {
+				max-height: 1000px;
+			}
+			.search-bar {
+				background: #EE3;
+			}
+			.connection-area {
+			}
+		</style>
+	</head>
+	<body onload="ClientUI.init();">
+		<div class="main">
+			<div class="connection-area">
+				<input type="text" id="name" placeholder="Type in your name here" />
+				<button id="connect" onclick="ClientUI.connectClick()">Connect</button>
+				<button disabled="disabled" id="disconnect" onclick="ClientUI.disconnectClick()">Disconnect</button>
+			</div>
+			<div class="communication-area">
+				<div class="search-bar">
+					<input type="text" id="find_name" placeholder="Find user" />
+					<button id="find" onclick="ClientUI.findUserClick()">Find &amp; add</button>
+				</div>
+				<div class="contacts-area">
+					<h4>Your contacts:</h4>
+					<ul id="contact_list">
+					</ul>
+				</div>
+				<div class="chat-area">		
+					<h4>Chat windows:</h4>
+					<ul id="chat_windows">
+					</ul>
+				</div>
+			</div>
+		</div>
+		<div id="chat_window_template">
+			<h4></h4>
+			<div readonly="readonly" class="chat_window_messages"></div>
+			<input placeholder="Type in your message here" autofocus="autofocus" />
+		</div>
+	</body>
+</html>
